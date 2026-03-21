@@ -31,7 +31,10 @@
  * - Semantic validation: Checking consistency using loaded CompilerProps
  */
 
+import assert from 'node:assert';
+
 import {parseProperties} from './properties.js';
+import {toProperty} from './utils.js';
 
 export interface ValidationIssue {
     line: number;
@@ -60,6 +63,7 @@ export interface RawFileValidationResult {
     emptyListElements: ValidationIssue[];
     typoCompilers: ValidationIssue[];
     invalidPropertyFormat: ValidationIssue[];
+    invalidAppends: ValidationIssue[];
     suspiciousPaths: ValidationIssue[];
     duplicatedCompilerRefs: ValidationIssue[];
     duplicatedGroupRefs: ValidationIssue[];
@@ -136,21 +140,54 @@ interface EffectiveProperty {
     line: number;
 }
 
-function buildEffectiveProperties(properties: ParsedProperty[]): EffectiveProperty[] {
+function getTypedPropertyValue(key: string, value: string): string | number | boolean {
+    if (key.endsWith('.version') || key.endsWith('.semver')) {
+        return value;
+    }
+
+    return toProperty(value);
+}
+
+function buildEffectiveProperties(properties: ParsedProperty[]): {
+    effectiveProperties: EffectiveProperty[];
+    invalidAppends: ValidationIssue[];
+} {
     const effectiveProperties = new Map<string, EffectiveProperty>();
+    const effectivePropertyTypes = new Map<string, string | number | boolean>();
+    const invalidAppends: ValidationIssue[] = [];
 
     for (const property of properties) {
+        const typedValue = getTypedPropertyValue(property.key, property.value);
+
         if (property.operator === '+=') {
-            const existing = effectiveProperties.get(property.key);
-            if (!existing) {
+            const existingType = effectivePropertyTypes.get(property.key);
+            if (existingType === undefined) {
+                invalidAppends.push({
+                    line: property.line,
+                    text: `Cannot append to undefined property ${property.key}`,
+                    id: property.key,
+                });
                 continue;
             }
+
+            if (typeof existingType !== 'string' || typeof typedValue !== 'string') {
+                invalidAppends.push({
+                    line: property.line,
+                    text: `Cannot append to non-string property ${property.key}`,
+                    id: property.key,
+                });
+                continue;
+            }
+
+            const existing = effectiveProperties.get(property.key);
+            assert(existing, `effectiveProperties missing key that effectivePropertyTypes has: ${property.key}`);
 
             effectiveProperties.set(property.key, {
                 key: property.key,
                 value: existing.value + property.value,
                 line: property.line,
             });
+            effectivePropertyTypes.set(property.key, existingType + typedValue);
             continue;
         }
 
@@ -159,9 +196,13 @@ function buildEffectiveProperties(properties: ParsedProperty[]): EffectiveProper
             value: property.value,
             line: property.line,
         });
+        effectivePropertyTypes.set(property.key, typedValue);
     }
 
-    return [...effectiveProperties.values()];
+    return {
+        effectiveProperties: [...effectiveProperties.values()],
+        invalidAppends,
+    };
 }
 
 function isColonSeparatedListKey(key: string): boolean {
@@ -273,6 +314,7 @@ export function validateRawFile(
         emptyListElements: [],
         typoCompilers: [],
         invalidPropertyFormat: [...parsed.parseErrors], // Copy parse errors from library
+        invalidAppends: [],
         suspiciousPaths: [],
         duplicatedCompilerRefs: [],
         duplicatedGroupRefs: [],
@@ -317,7 +359,9 @@ export function validateRawFile(
         !parsed.filename.endsWith('.defaults.properties') &&
         !parsed.filename.endsWith('.local.properties');
 
-    const effectiveProperties = buildEffectiveProperties(parsed.properties);
+    const effectivePropertiesResult = buildEffectiveProperties(parsed.properties);
+    const {effectiveProperties, invalidAppends} = effectivePropertiesResult;
+    result.invalidAppends.push(...invalidAppends);
     const effectivePropertiesByKey = new Map(effectiveProperties.map(prop => [prop.key, prop]));
     const getEffectiveLine = (prefix: string) => effectiveProperties.find(p => p.key.startsWith(prefix))?.line ?? 0;
 
@@ -647,6 +691,7 @@ export function filterDisabled(result: RawFileValidationResult, disabledIds: Set
         emptyListElements: filterIssues(result.emptyListElements),
         typoCompilers: filterIssues(result.typoCompilers),
         invalidPropertyFormat: filterIssues(result.invalidPropertyFormat),
+        invalidAppends: filterIssues(result.invalidAppends),
         suspiciousPaths: filterIssues(result.suspiciousPaths),
         duplicatedCompilerRefs: filterIssues(result.duplicatedCompilerRefs),
         duplicatedGroupRefs: filterIssues(result.duplicatedGroupRefs),
@@ -673,6 +718,7 @@ export function hasIssues(result: RawFileValidationResult): boolean {
         result.emptyListElements.length > 0 ||
         result.typoCompilers.length > 0 ||
         result.invalidPropertyFormat.length > 0 ||
+        result.invalidAppends.length > 0 ||
         result.suspiciousPaths.length > 0 ||
         result.duplicatedCompilerRefs.length > 0 ||
         result.duplicatedGroupRefs.length > 0 ||
@@ -709,6 +755,7 @@ export function formatValidationResult(filename: string, result: RawFileValidati
     formatIssues('Empty list elements', result.emptyListElements);
     formatIssues('Typo compilers', result.typoCompilers);
     formatIssues('Invalid property format', result.invalidPropertyFormat);
+    formatIssues('Invalid appends', result.invalidAppends);
     formatIssues('Suspicious paths', result.suspiciousPaths);
     formatIssues('Duplicated compiler refs', result.duplicatedCompilerRefs);
     formatIssues('Duplicated group refs', result.duplicatedGroupRefs);
@@ -744,8 +791,9 @@ export function validateCrossFileCompilerIds(
 
     for (const {filename, parsed} of files) {
         const seenInFile = new Set<string>();
+        const {effectiveProperties} = buildEffectiveProperties(parsed.properties);
 
-        for (const prop of parsed.properties) {
+        for (const prop of effectiveProperties) {
             const match = prop.key.match(PATTERNS.compilerId);
             if (match) {
                 const compilerId = match[1];

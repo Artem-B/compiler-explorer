@@ -205,6 +205,37 @@ baz=qux
         });
     });
 
+    describe('invalid append detection', () => {
+        it('should report += on undefined properties', () => {
+            expect(validate('foo+=bar').invalidAppends).toContainEqual(
+                expect.objectContaining({id: 'foo', text: 'Cannot append to undefined property foo'}),
+            );
+        });
+
+        it('should report += on non-string properties', () => {
+            expect(validate('flag=true\nflag+=more').invalidAppends).toContainEqual(
+                expect.objectContaining({id: 'flag', text: 'Cannot append to non-string property flag'}),
+            );
+        });
+
+        it('should report += when the appended value is not a string property value', () => {
+            expect(validate('opts=-Wall\nopts+=1').invalidAppends).toContainEqual(
+                expect.objectContaining({id: 'opts', text: 'Cannot append to non-string property opts'}),
+            );
+        });
+
+        it('should not report valid += on string properties', () => {
+            expect(validate('opts=-Wall\nopts+= -Wextra').invalidAppends).toHaveLength(0);
+        });
+
+        it('should allow Disabled: comments to filter invalid appends', () => {
+            const parsed = parsePropertiesFileRaw('# Disabled: foo\nfoo+=bar', 'test.properties');
+            const filtered = filterDisabled(validateRawFile(parsed), parsed.disabledIds);
+
+            expect(filtered.invalidAppends).toEqual([]);
+        });
+    });
+
     describe('typo detection', () => {
         it('should detect compilers. instead of compiler.', () => {
             const result = validate('compilers.gcc.exe=/path/to/gcc');
@@ -586,6 +617,22 @@ compiler.gcc.semver=12.0
 
             expect(result.duplicateCompilerIds.size).toBe(0);
         });
+
+        it('should not treat append-only compiler properties as compiler definitions across files', () => {
+            const appendedOnlyContent = `compiler.gcc.options+= -Wall`;
+            const definedCompilerContent = `compiler.gcc.exe=/opt/compiler-explorer/gcc/bin/gcc`;
+
+            const appendedOnly = parsePropertiesFileRaw(appendedOnlyContent, 'c++.amazon.properties');
+            const definedCompiler = parsePropertiesFileRaw(definedCompilerContent, 'c.amazon.properties');
+
+            const result = validateCrossFileCompilerIds([
+                {filename: 'c++.amazon.properties', parsed: appendedOnly},
+                {filename: 'c.amazon.properties', parsed: definedCompiler},
+            ]);
+
+            expect(result.duplicateCompilerIds.has('gcc')).toBe(false);
+            expect(result.duplicateCompilerIds.size).toBe(0);
+        });
     });
 });
 
@@ -642,6 +689,7 @@ describe('Real config validation', () => {
         {name: 'empty list elements', field: 'emptyListElements'},
         {name: 'typo compilers', field: 'typoCompilers', useFiltered: true},
         {name: 'invalid property format', field: 'invalidPropertyFormat'},
+        {name: 'invalid appends', field: 'invalidAppends', useFiltered: true},
         {name: 'orphaned compilers (exe)', field: 'orphanedCompilerExe', useFiltered: true},
         {name: 'orphaned compilers (ID)', field: 'orphanedCompilerId', useFiltered: true},
         {name: 'orphaned groups', field: 'orphanedGroups', useFiltered: true},
