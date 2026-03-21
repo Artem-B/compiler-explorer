@@ -83,24 +83,17 @@ export interface RawValidatorOptions {
 // Regex patterns for property file validation
 const PATTERNS = {
     property: /(.+?)(\+?=)(.*)/,
-    compilersList: /^compilers=(.*)$/,
-    aliasList: /^alias=(.*)$/,
-    groupCompilers: /^group\.([^.]+)\.compilers=(.*)$/,
     groupName: /^group\.([^.]+)\./,
-    compilerExe: /^compiler\.([^.]+)\.exe=(.*)$/,
+    groupCompilers: /^group\.([^.]+)\.compilers$/,
+    compilerExe: /^compiler\.([^.]+)\.exe$/,
     compilerId: /^compiler\.([^.]+)\./,
     typoCompilers: /^compilers\./,
-    defaultCompiler: /^defaultCompiler=(.*)$/,
-    formattersList: /^formatters=(.*)$/,
-    formatterExe: /^formatter\.([^.]+)\.exe=(.*)$/,
+    formatterExe: /^formatter\.([^.]+)\.exe$/,
     formatterId: /^formatter\.([^.]+)\./,
-    libsList: /^libs=(.+)$/,
-    libVersionsList: /^libs\.([^.]+)\.versions=(.*)$/,
-    libVersion: /^libs\.([^.]+)\.versions\.([^.]+)\.version/,
-    toolsList: /^tools=(.+)$/,
-    toolExe: /^tools\.([^.]+)\.exe=(.*)$/,
+    libVersionsList: /^libs\.([^.]+)\.versions$/,
+    libVersion: /^libs\.([^.]+)\.versions\.([^.]+)\.version$/,
+    toolExe: /^tools\.([^.]+)\.exe$/,
     toolId: /^tools\.([^.]+)\./,
-    emptyList: /^.*(compilers|formatters|versions|tools|alias|exclude|libPath)=(.*::.*|:.*|.*:)$/,
     disabled: /^#\s*Disabled?:?\s*(.*)$/i,
 };
 
@@ -135,6 +128,86 @@ function isSuspiciousPath(path: string): boolean {
 export function parseCompilersList(value: string): string[] {
     if (!value || !value.trim()) return [];
     return value.split(':').filter(id => id.trim() !== '');
+}
+
+interface EffectiveProperty {
+    key: string;
+    value: string;
+    line: number;
+}
+
+function buildEffectiveProperties(properties: ParsedProperty[]): EffectiveProperty[] {
+    const effectiveProperties = new Map<string, EffectiveProperty>();
+
+    for (const property of properties) {
+        if (property.operator === '+=') {
+            const existing = effectiveProperties.get(property.key);
+            if (!existing) {
+                continue;
+            }
+
+            effectiveProperties.set(property.key, {
+                key: property.key,
+                value: existing.value + property.value,
+                line: property.line,
+            });
+            continue;
+        }
+
+        effectiveProperties.set(property.key, {
+            key: property.key,
+            value: property.value,
+            line: property.line,
+        });
+    }
+
+    return [...effectiveProperties.values()];
+}
+
+function isColonSeparatedListKey(key: string): boolean {
+    return (
+        key === 'compilers' ||
+        key === 'formatters' ||
+        key === 'tools' ||
+        key === 'alias' ||
+        key.endsWith('.alias') ||
+        key.endsWith('.compilers') ||
+        key.endsWith('.versions') ||
+        key.endsWith('.exclude') ||
+        key.endsWith('.libPath')
+    );
+}
+
+function hasEmptyListElements(value: string): boolean {
+    return value.includes('::') || value.startsWith(':') || value.endsWith(':');
+}
+
+function collectCompilerRefs(
+    value: string,
+    line: number,
+    listedCompilers: Map<string, number>,
+    listedGroups: Map<string, number>,
+    result: RawFileValidationResult,
+) {
+    const ids = parseCompilersList(value);
+    const seenInThisList = new Set<string>();
+
+    for (const id of ids) {
+        if (id.startsWith('&')) {
+            const groupName = id.slice(1);
+            if (listedGroups.has(groupName) || seenInThisList.has(id)) {
+                result.duplicatedGroupRefs.push({line, text: groupName, id: groupName});
+            }
+            listedGroups.set(groupName, line);
+            seenInThisList.add(id);
+        } else if (!id.includes('@')) {
+            if (listedCompilers.has(id) || seenInThisList.has(id)) {
+                result.duplicatedCompilerRefs.push({line, text: id, id});
+            }
+            listedCompilers.set(id, line);
+            seenInThisList.add(id);
+        }
+    }
 }
 
 /**
@@ -244,11 +317,15 @@ export function validateRawFile(
         !parsed.filename.endsWith('.defaults.properties') &&
         !parsed.filename.endsWith('.local.properties');
 
-    // First pass: collect all data
+    const effectiveProperties = buildEffectiveProperties(parsed.properties);
+    const effectivePropertiesByKey = new Map(effectiveProperties.map(prop => [prop.key, prop]));
+    const getEffectiveLine = (prefix: string) => effectiveProperties.find(p => p.key.startsWith(prefix))?.line ?? 0;
+
+    // First pass: collect raw-property issues
     const seenAssignedKeys = new Set<string>();
     for (const prop of parsed.properties) {
         const {key, value, line, operator} = prop;
-        const fullLine = `${key}${operator === '+=' ? '+' : ''}=${value}`;
+        const fullLine = `${key}${operator}${value}`;
 
         // Check for duplicate keys
         if (operator === '=') {
@@ -263,67 +340,28 @@ export function validateRawFile(
         if (PATTERNS.typoCompilers.test(key)) {
             result.typoCompilers.push({line, text: fullLine, id: key});
         }
+    }
 
-        // Check for empty list elements
-        if (PATTERNS.emptyList.test(fullLine)) {
+    // Second pass: collect semantic data from the effective merged view
+    for (const prop of effectiveProperties) {
+        const {key, value, line} = prop;
+        const fullLine = `${key}=${value}`;
+
+        if (isColonSeparatedListKey(key) && hasEmptyListElements(value)) {
             result.emptyListElements.push({line, text: fullLine});
         }
 
         // Parse compilers= list (top-level or group)
-        const compilersListMatch = fullLine.match(PATTERNS.compilersList);
-        if (compilersListMatch) {
-            const ids = parseCompilersList(compilersListMatch[1]);
-            const seenInThisList = new Set<string>();
-            for (const id of ids) {
-                if (id.startsWith('&')) {
-                    const groupName = id.slice(1);
-                    if (listedGroups.has(groupName)) {
-                        result.duplicatedGroupRefs.push({line, text: groupName, id: groupName});
-                    } else if (seenInThisList.has(id)) {
-                        result.duplicatedGroupRefs.push({line, text: groupName, id: groupName});
-                    }
-                    listedGroups.set(groupName, line);
-                    seenInThisList.add(id);
-                } else if (!id.includes('@')) {
-                    // Not a remote reference
-                    if (listedCompilers.has(id)) {
-                        result.duplicatedCompilerRefs.push({line, text: id, id});
-                    } else if (seenInThisList.has(id)) {
-                        result.duplicatedCompilerRefs.push({line, text: id, id});
-                    }
-                    listedCompilers.set(id, line);
-                    seenInThisList.add(id);
-                }
-            }
+        if (key === 'compilers') {
+            collectCompilerRefs(value, line, listedCompilers, listedGroups, result);
         }
 
         // Parse group.X.compilers= list
-        const groupCompilersMatch = fullLine.match(PATTERNS.groupCompilers);
+        const groupCompilersMatch = key.match(PATTERNS.groupCompilers);
         if (groupCompilersMatch) {
             const groupName = groupCompilersMatch[1];
-            const ids = parseCompilersList(groupCompilersMatch[2]);
             seenGroups.add(groupName);
-            const seenInThisList = new Set<string>();
-            for (const id of ids) {
-                if (id.startsWith('&')) {
-                    const subGroupName = id.slice(1);
-                    if (listedGroups.has(subGroupName)) {
-                        result.duplicatedGroupRefs.push({line, text: subGroupName, id: subGroupName});
-                    } else if (seenInThisList.has(id)) {
-                        result.duplicatedGroupRefs.push({line, text: subGroupName, id: subGroupName});
-                    }
-                    listedGroups.set(subGroupName, line);
-                    seenInThisList.add(id);
-                } else if (!id.includes('@')) {
-                    if (listedCompilers.has(id)) {
-                        result.duplicatedCompilerRefs.push({line, text: id, id});
-                    } else if (seenInThisList.has(id)) {
-                        result.duplicatedCompilerRefs.push({line, text: id, id});
-                    }
-                    listedCompilers.set(id, line);
-                    seenInThisList.add(id);
-                }
-            }
+            collectCompilerRefs(value, line, listedCompilers, listedGroups, result);
         }
 
         // Parse group.X.* (marks group as seen/defined)
@@ -333,15 +371,14 @@ export function validateRawFile(
         }
 
         // Parse compiler.X.exe=
-        const compilerExeMatch = fullLine.match(PATTERNS.compilerExe);
+        const compilerExeMatch = key.match(PATTERNS.compilerExe);
         if (compilerExeMatch) {
             seenCompilersExe.set(compilerExeMatch[1], line);
 
             // Check suspicious path
             if (checkSuspicious) {
-                const path = compilerExeMatch[2];
-                if (isSuspiciousPath(path)) {
-                    result.suspiciousPaths.push({line, text: path, id: compilerExeMatch[1]});
+                if (isSuspiciousPath(value)) {
+                    result.suspiciousPaths.push({line, text: value, id: compilerExeMatch[1]});
                 }
             }
         }
@@ -353,38 +390,34 @@ export function validateRawFile(
         }
 
         // Parse alias= (adds to seen compilers)
-        const aliasMatch = fullLine.match(PATTERNS.aliasList);
-        if (aliasMatch) {
-            const ids = parseCompilersList(aliasMatch[1]);
+        if (key === 'alias') {
+            const ids = parseCompilersList(value);
             for (const id of ids) {
                 seenCompilersExe.set(id, line);
             }
         }
 
         // Parse defaultCompiler=
-        const defaultMatch = fullLine.match(PATTERNS.defaultCompiler);
-        if (defaultMatch) {
-            defaultCompiler = {id: defaultMatch[1].trim(), line};
+        if (key === 'defaultCompiler') {
+            defaultCompiler = {id: value.trim(), line};
         }
 
         // Parse formatters=
-        const formattersMatch = fullLine.match(PATTERNS.formattersList);
-        if (formattersMatch) {
-            const ids = parseCompilersList(formattersMatch[1]);
+        if (key === 'formatters') {
+            const ids = parseCompilersList(value);
             for (const id of ids) {
                 listedFormatters.set(id, line);
             }
         }
 
         // Parse formatter.X.exe=
-        const formatterExeMatch = fullLine.match(PATTERNS.formatterExe);
+        const formatterExeMatch = key.match(PATTERNS.formatterExe);
         if (formatterExeMatch) {
             seenFormattersExe.set(formatterExeMatch[1], line);
 
             if (checkSuspicious) {
-                const path = formatterExeMatch[2];
-                if (isSuspiciousPath(path)) {
-                    result.suspiciousPaths.push({line, text: path, id: formatterExeMatch[1]});
+                if (isSuspiciousPath(value)) {
+                    result.suspiciousPaths.push({line, text: value, id: formatterExeMatch[1]});
                 }
             }
         }
@@ -396,23 +429,21 @@ export function validateRawFile(
         }
 
         // Parse tools=
-        const toolsMatch = fullLine.match(PATTERNS.toolsList);
-        if (toolsMatch) {
-            const ids = parseCompilersList(toolsMatch[1]);
+        if (key === 'tools') {
+            const ids = parseCompilersList(value);
             for (const id of ids) {
                 listedTools.set(id, line);
             }
         }
 
         // Parse tools.X.exe=
-        const toolExeMatch = fullLine.match(PATTERNS.toolExe);
+        const toolExeMatch = key.match(PATTERNS.toolExe);
         if (toolExeMatch) {
             seenToolsExe.set(toolExeMatch[1], line);
 
             if (checkSuspicious) {
-                const path = toolExeMatch[2];
-                if (isSuspiciousPath(path)) {
-                    result.suspiciousPaths.push({line, text: path, id: toolExeMatch[1]});
+                if (isSuspiciousPath(value)) {
+                    result.suspiciousPaths.push({line, text: value, id: toolExeMatch[1]});
                 }
             }
         }
@@ -424,27 +455,26 @@ export function validateRawFile(
         }
 
         // Parse libs=
-        const libsMatch = fullLine.match(PATTERNS.libsList);
-        if (libsMatch) {
-            const ids = parseCompilersList(libsMatch[1]);
+        if (key === 'libs') {
+            const ids = parseCompilersList(value);
             for (const id of ids) {
                 listedLibsIds.set(id, line);
             }
         }
 
         // Parse libs.X.versions=
-        const libVersionsMatch = fullLine.match(PATTERNS.libVersionsList);
+        const libVersionsMatch = key.match(PATTERNS.libVersionsList);
         if (libVersionsMatch) {
             const libId = libVersionsMatch[1];
             seenLibsIds.add(libId);
-            const versions = parseCompilersList(libVersionsMatch[2]);
+            const versions = parseCompilersList(value);
             for (const version of versions) {
                 listedLibVersions.set(`${libId} ${version}`, line);
             }
         }
 
         // Parse libs.X.versions.Y.version
-        const libVersionMatch = fullLine.match(PATTERNS.libVersion);
+        const libVersionMatch = key.match(PATTERNS.libVersion);
         if (libVersionMatch) {
             const libId = libVersionMatch[1];
             const version = libVersionMatch[2];
@@ -476,7 +506,7 @@ export function validateRawFile(
         }
         for (const id of seenCompilersId) {
             if (!listedCompilers.has(id)) {
-                const line = parsed.properties.find(p => p.key.startsWith(`compiler.${id}.`))?.line ?? 0;
+                const line = getEffectiveLine(`compiler.${id}.`);
                 result.orphanedCompilerId.push({line, text: id, id});
             }
         }
@@ -490,7 +520,7 @@ export function validateRawFile(
     }
     for (const groupName of seenGroups) {
         if (!listedGroups.has(groupName)) {
-            const line = parsed.properties.find(p => p.key.startsWith(`group.${groupName}.`))?.line ?? 0;
+            const line = getEffectiveLine(`group.${groupName}.`);
             result.orphanedGroups.push({line, text: groupName, id: groupName});
         }
     }
@@ -514,7 +544,7 @@ export function validateRawFile(
     }
     for (const id of seenFormattersId) {
         if (!listedFormatters.has(id)) {
-            const line = parsed.properties.find(p => p.key.startsWith(`formatter.${id}.`))?.line ?? 0;
+            const line = getEffectiveLine(`formatter.${id}.`);
             result.orphanedFormatterId.push({line, text: id, id});
         }
     }
@@ -538,13 +568,13 @@ export function validateRawFile(
     }
     for (const id of seenToolsId) {
         if (!listedTools.has(id)) {
-            const line = parsed.properties.find(p => p.key.startsWith(`tools.${id}.`))?.line ?? 0;
+            const line = getEffectiveLine(`tools.${id}.`);
             result.orphanedToolId.push({line, text: id, id});
         }
     }
 
     // Orphaned libs (only check if libs= is explicitly declared)
-    const hasExplicitLibsList = parsed.properties.some(p => p.key === 'libs');
+    const hasExplicitLibsList = effectivePropertiesByKey.has('libs');
     if (hasExplicitLibsList) {
         for (const [id, line] of listedLibsIds) {
             if (!seenLibsIds.has(id)) {
@@ -553,7 +583,7 @@ export function validateRawFile(
         }
         for (const id of seenLibsIds) {
             if (!listedLibsIds.has(id)) {
-                const line = parsed.properties.find(p => p.key.startsWith(`libs.${id}.`))?.line ?? 0;
+                const line = getEffectiveLine(`libs.${id}.`);
                 result.orphanedLibIds.push({line, text: id, id});
             }
         }
@@ -568,7 +598,7 @@ export function validateRawFile(
     for (const key of seenLibVersions) {
         if (!listedLibVersions.has(key)) {
             const [libId, version] = key.split(' ');
-            const line = parsed.properties.find(p => p.key.startsWith(`libs.${libId}.versions.${version}.`))?.line ?? 0;
+            const line = getEffectiveLine(`libs.${libId}.versions.${version}.`);
             result.orphanedLibVersions.push({line, text: key, id: key});
         }
     }
@@ -591,7 +621,7 @@ export function validateRawFile(
     const isLanguageFile = !isAllowedEmpty && parsed.filename.endsWith('.properties');
 
     if (isLanguageFile) {
-        const hasCompilersList = parsed.properties.some(p => p.key === 'compilers');
+        const hasCompilersList = effectivePropertiesByKey.has('compilers');
         const hasGroups = seenGroups.size > 0 || listedGroups.size > 0;
         const hasCompilerDefinitions = seenCompilersExe.size > 0 || seenCompilersId.size > 0;
 

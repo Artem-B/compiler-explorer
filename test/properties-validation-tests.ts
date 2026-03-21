@@ -161,6 +161,15 @@ baz=qux
         });
     });
 
+    describe('append handling', () => {
+        it('should not crash when += is used without a prior = assignment', () => {
+            const content = ['foo+=bar', 'compilers=gcc:'].join('\n');
+            const result = validate(content);
+
+            expect(result.emptyListElements).toContainEqual(expect.objectContaining({text: 'compilers=gcc:'}));
+        });
+    });
+
     describe('empty list element detection', () => {
         it.each([
             ['double colons in compilers', 'compilers=gcc::clang'],
@@ -168,8 +177,15 @@ baz=qux
             ['trailing colons', 'compilers=gcc:'],
             ['empty elements in formatters', 'formatters=clangformat::rustfmt'],
             ['empty elements in tools', 'tools=readelf:nm:'],
+            ['empty elements in compiler aliases', 'compiler.gcc.alias=oldgcc:'],
         ])('should detect %s', (_, content) => {
             expect(validate(content).emptyListElements).toHaveLength(1);
+        });
+
+        it('should detect empty elements introduced by +=', () => {
+            const result = validate(['compilers=gcc', 'compilers+=:'].join('\n'));
+
+            expect(result.emptyListElements).toContainEqual(expect.objectContaining({text: 'compilers=gcc:'}));
         });
 
         it('should not report valid compilers list', () => {
@@ -268,6 +284,23 @@ baz=qux
             expect(result.orphanedCompilerExe).toHaveLength(0);
         });
 
+        it('should honor appended compiler lists when checking for orphans', () => {
+            const result = validate(
+                [
+                    'compilers=gcc',
+                    'compilers+=:clang',
+                    'compiler.gcc.exe=/opt/compiler-explorer/gcc/bin/gcc',
+                    'compiler.gcc.name=GCC',
+                    'compiler.clang.exe=/opt/compiler-explorer/clang/bin/clang',
+                    'compiler.clang.name=Clang',
+                ].join('\n'),
+                'c++.amazon.properties',
+            );
+
+            expect(result.orphanedCompilerExe).toEqual([]);
+            expect(result.orphanedCompilerId).toEqual([]);
+        });
+
         it('should ignore remote compiler references (with @)', () => {
             const result = validate(`compilers=gcc:remote@host\ncompiler.gcc.exe=/opt/compiler-explorer/gcc/bin/gcc`);
             expect(result.orphanedCompilerExe).toHaveLength(0);
@@ -278,6 +311,25 @@ baz=qux
                 `compilers=gcc:oldgcc\ncompiler.gcc.exe=/opt/compiler-explorer/gcc/bin/gcc\nalias=oldgcc`,
             );
             expect(result.orphanedCompilerExe).toHaveLength(0);
+        });
+
+        it('should honor appended group compiler lists when checking orphans and duplicates', () => {
+            const result = validate(
+                [
+                    'compilers=&mygroup',
+                    'group.mygroup.compilers=gcc',
+                    'group.mygroup.compilers+=:gcc:clang',
+                    'compiler.gcc.exe=/opt/compiler-explorer/gcc/bin/gcc',
+                    'compiler.gcc.name=GCC',
+                    'compiler.clang.exe=/opt/compiler-explorer/clang/bin/clang',
+                    'compiler.clang.name=Clang',
+                ].join('\n'),
+                'c++.amazon.properties',
+            );
+
+            expect(result.orphanedCompilerExe).toEqual([]);
+            expect(result.orphanedCompilerId).toEqual([]);
+            expect(result.duplicatedCompilerRefs).toContainEqual(expect.objectContaining({id: 'gcc'}));
         });
     });
 
@@ -313,6 +365,12 @@ baz=qux
     describe('duplicated reference detection', () => {
         it('should detect duplicate compiler references in same list', () => {
             expect(validate('compilers=gcc:clang:gcc').duplicatedCompilerRefs).toContainEqual(
+                expect.objectContaining({id: 'gcc'}),
+            );
+        });
+
+        it('should detect duplicate compiler references introduced by +=', () => {
+            expect(validate('compilers=gcc\ncompilers+=:gcc').duplicatedCompilerRefs).toContainEqual(
                 expect.objectContaining({id: 'gcc'}),
             );
         });
