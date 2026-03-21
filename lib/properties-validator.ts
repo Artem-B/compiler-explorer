@@ -39,10 +39,13 @@ export interface ValidationIssue {
     id?: string;
 }
 
+export type PropertyOperator = '=' | '+=';
+
 export interface ParsedProperty {
     key: string;
     value: string;
     line: number;
+    operator: PropertyOperator;
 }
 
 export interface ParsedPropertiesFile {
@@ -79,7 +82,7 @@ export interface RawValidatorOptions {
 
 // Regex patterns for property file validation
 const PATTERNS = {
-    property: /^([^#\s][^=]*)=(.*)$/,
+    property: /(.+?)(\+?=)(.*)/,
     compilersList: /^compilers=(.*)$/,
     aliasList: /^alias=(.*)$/,
     groupCompilers: /^group\.([^.]+)\.compilers=(.*)$/,
@@ -152,12 +155,13 @@ export function parsePropertiesFileRaw(content: string, filename: string): Parse
     const lines = content.split('\n');
     for (let i = 0; i < lines.length; i++) {
         const lineNumber = i + 1;
-        const text = lines[i].trim();
+        const lineOrig = lines[i];
+        const trimmed = lineOrig.trim();
 
-        if (!text) continue;
+        if (!trimmed) continue;
 
         // Check for Disabled: comments
-        const disabledMatch = text.match(PATTERNS.disabled);
+        const disabledMatch = trimmed.match(PATTERNS.disabled);
         if (disabledMatch) {
             const ids = disabledMatch[1].split(/\s+/).filter(id => id.trim() !== '');
             for (const id of ids) {
@@ -166,16 +170,17 @@ export function parsePropertiesFileRaw(content: string, filename: string): Parse
             continue;
         }
 
-        // Skip other comments
-        if (text.startsWith('#')) continue;
+        const text = lineOrig.replace(/#.*/, '').trim();
+        if (!text) continue;
 
         // Parse property line
         const match = text.match(PATTERNS.property);
         if (match) {
             properties.push({
                 key: match[1].trim(),
-                value: match[2].trim(),
+                value: match[2] === '+=' ? match[3].trimEnd() : match[3].trim(),
                 line: lineNumber,
+                operator: match[2] as PropertyOperator,
             });
         }
     }
@@ -212,7 +217,6 @@ export function validateRawFile(
     };
 
     // Track what we've seen
-    const seenKeys = new Set<string>();
     const listedCompilers = new Map<string, number>(); // id -> line number
     const listedGroups = new Map<string, number>(); // group name -> line number
     const seenCompilersExe = new Map<string, number>();
@@ -241,15 +245,18 @@ export function validateRawFile(
         !parsed.filename.endsWith('.local.properties');
 
     // First pass: collect all data
+    const seenAssignedKeys = new Set<string>();
     for (const prop of parsed.properties) {
-        const {key, value, line} = prop;
-        const fullLine = `${key}=${value}`;
+        const {key, value, line, operator} = prop;
+        const fullLine = `${key}${operator === '+=' ? '+' : ''}=${value}`;
 
         // Check for duplicate keys
-        if (seenKeys.has(key)) {
-            result.duplicateKeys.push({line, text: key, id: key});
-        } else {
-            seenKeys.add(key);
+        if (operator === '=') {
+            if (seenAssignedKeys.has(key)) {
+                result.duplicateKeys.push({line, text: key, id: key});
+            } else {
+                seenAssignedKeys.add(key);
+            }
         }
 
         // Check for typo: compilers. instead of compiler.

@@ -78,8 +78,21 @@ baz=qux
 
             expect(parsed.filename).toBe('test.properties');
             expect(parsed.properties).toHaveLength(2);
-            expect(parsed.properties[0]).toEqual({key: 'foo', value: 'bar', line: 2});
-            expect(parsed.properties[1]).toEqual({key: 'baz', value: 'qux', line: 3});
+            expect(parsed.properties[0]).toEqual({key: 'foo', value: 'bar', line: 2, operator: '='});
+            expect(parsed.properties[1]).toEqual({key: 'baz', value: 'qux', line: 3, operator: '='});
+        });
+
+        it('should parse += properties and preserve the operator', () => {
+            const content = `
+compilers=gcc
+compilers+=:clang
+`;
+            const parsed = parsePropertiesFileRaw(content, 'test.properties');
+
+            expect(parsed.properties).toEqual([
+                {key: 'compilers', value: 'gcc', line: 2, operator: '='},
+                {key: 'compilers', value: ':clang', line: 3, operator: '+='},
+            ]);
         });
 
         it('should skip comments', () => {
@@ -111,6 +124,13 @@ foo=bar
             expect(parsed.properties[0].value).toBe('-O2 -DFOO=bar');
         });
 
+        it('should ignore inline comments like the runtime parser', () => {
+            const content = `foo=bar # comment`;
+            const parsed = parsePropertiesFileRaw(content, 'test.properties');
+
+            expect(parsed.properties[0].value).toBe('bar');
+        });
+
         it('should collect parse errors for invalid lines', () => {
             const content = `
 foo=bar
@@ -130,6 +150,10 @@ baz=qux
             const result = validate('foo=bar\nfoo=baz');
             expect(result.duplicateKeys).toHaveLength(1);
             expect(result.duplicateKeys[0].id).toBe('foo');
+        });
+
+        it('should not report += as a duplicate key assignment', () => {
+            expect(validate('foo=bar\nfoo+=baz').duplicateKeys).toHaveLength(0);
         });
 
         it('should not report unique keys as duplicates', () => {
